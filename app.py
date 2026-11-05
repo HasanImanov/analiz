@@ -75,6 +75,61 @@ def matris_hda(M):
     return {"H": np.tril(M, -1).sum() / cem, "D": np.trace(M) / cem, "A": np.triu(M, 1).sum() / cem}
 
 
+EV_Q, QONAQ_Q = np.meshgrid(QOLLAR, QOLLAR, indexing="ij")   # hər xananın ev və qonaq qolu
+
+
+def matris_normal(M):
+    return M / M.sum()
+
+
+def matris_qollar(M):
+    """Matrisdən: hər iki komanda vurur (BTTS) və 2.5-dən çox qol ehtimalı."""
+    M = matris_normal(M)
+    return {"btts": M[(EV_Q > 0) & (QONAQ_Q > 0)].sum(), "o25": M[(EV_Q + QONAQ_Q) > 2.5].sum()}
+
+
+def netice_daxilinde_hesablar(M, netice, n=3, btts=None, ust=None, p_btts=0.5, p_ust=0.5):
+    """
+    Proqnoz edilən nəticəyə (H/D/A) UYĞUN gələn ən ehtimal olunan hesablar.
+    btts / ust verilsə, hesab həm də 'hər iki komanda vurur' və '2.5 üst/alt' proqnozuna uyğun olur.
+    Şərtlər birlikdə mümkün deyilsə (məs. 'ev udur + Bəli + Alt'), etibarı AŞAĞI olan şərt buraxılır.
+    """
+    M = matris_normal(M)
+    maska = {"H": EV_Q > QONAQ_Q, "D": EV_Q == QONAQ_Q, "A": EV_Q < QONAQ_Q}[netice]
+    sertler = []                              # (maska, etibar)
+    if btts is not None:
+        sertler.append((((EV_Q > 0) & (QONAQ_Q > 0)) == btts, max(p_btts, 1 - p_btts)))
+    if ust is not None:
+        sertler.append((((EV_Q + QONAQ_Q) > 2.5) == ust, max(p_ust, 1 - p_ust)))
+
+    sertler.sort(key=lambda s: s[1], reverse=True)   # ən etibarlı şərt əvvəldə
+    while sertler:
+        tam = maska.copy()
+        for s, _ in sertler:
+            tam &= s
+        if tam.any():
+            maska = tam
+            break
+        sertler.pop()                          # ən az etibarlı şərti burax
+
+    yalniz = np.where(maska, M, 0).ravel()
+    sira = [k for k in yalniz.argsort()[::-1][:n] if yalniz[k] > 0.001]   # 0% hesabları göstərmə
+    return [(f"{k // len(QOLLAR)}-{k % len(QOLLAR)}", yalniz[k]) for k in sira]
+
+
+def etibar(p):
+    if p >= 0.65:
+        return "🟢 Yüksək"
+    if p >= 0.55:
+        return "🟡 Orta"
+    return "🔴 Aşağı"
+
+
+def qarisdir(a, b, w):
+    """İki ehtimal lüğətini w : (1-w) nisbətində qarışdırır."""
+    return {k: w * a[k] + (1 - w) * b[k] for k in a}
+
+
 def komanda_lambda(df, ev, qonaq, tarix, il, ev_col, qonaq_col):
     """
     Gözlənilən qol:
@@ -143,6 +198,13 @@ e1 = st.sidebar.number_input("1 (ev sahibi)", min_value=1.01, value=None, step=0
 ex = st.sidebar.number_input("X (heç-heçə)", min_value=1.01, value=None, step=0.01, format="%.2f", placeholder="məs. 4.00")
 e2 = st.sidebar.number_input("2 (qonaq)", min_value=1.01, value=None, step=0.01, format="%.2f", placeholder="məs. 5.50")
 
+with st.sidebar.expander("➕ Qol əmsalları (istəyə bağlı)"):
+    st.caption("Yazsan, 'hər iki komanda vurur' və '2.5 üst/alt' proqnozu daha dəqiq olur.")
+    btts_y = st.number_input("Hər iki komanda vurur: Bəli", min_value=1.01, value=None, step=0.01, format="%.2f")
+    btts_n = st.number_input("Hər iki komanda vurur: Xeyr", min_value=1.01, value=None, step=0.01, format="%.2f")
+    ust25 = st.number_input("2.5 Üst", min_value=1.01, value=None, step=0.01, format="%.2f")
+    alt25 = st.number_input("2.5 Alt", min_value=1.01, value=None, step=0.01, format="%.2f")
+
 with st.sidebar.expander("⚙️ Ayarlar"):
     tolerans = st.slider("Əmsal oxşarlığı (±%)", 1, 20, 4) / 100
     min_oyun = st.slider("Minimum oxşar oyun", 10, 200, 40)
@@ -189,6 +251,112 @@ if komanda_var:
     if k_son is None:
         st.warning(f"Son {il} ildə komandaların hər birinin ən azı 5 oyunu olmalıdır "
                    f"({ev_komanda} evdə, {qonaq_komanda} səfərdə). Ayarlardan ili artır.")
+
+# =====================================================
+# 📌 YEKUN PROQNOZ (bütün üsulları birləşdirir)
+# =====================================================
+# Test nəticəsinə görə: əmsal + komanda olanda 80% əmsal, 20% komanda ən yaxşısıdır
+W_EMSAL = 0.8
+komanda_ok = komanda_var and k_son is not None
+
+if emsal_var or komanda_ok:
+    # --- Nəticə (H/D/A) ---
+    if emsal_var:
+        real_o = oxsar["FTR"].value_counts(normalize=True)
+        p_emsal = {k: real_o.get(k, 0) for k in "HDA"}
+        M_emsal = poisson_matris(oxsar["FTHG"].mean(), oxsar["FTAG"].mean())
+        q_emsal = {"btts": ((oxsar["FTHG"] > 0) & (oxsar["FTAG"] > 0)).mean(),
+                   "o25": ((oxsar["FTHG"] + oxsar["FTAG"]) > 2.5).mean()}
+        hd_o = oxsar.dropna(subset=["1HR"])
+        r1 = hd_o["1HR"].value_counts(normalize=True)
+        h1_emsal = {k: r1.get(k, 0) for k in "HDA"} if len(hd_o) else None
+    if komanda_ok:
+        M_kom = poisson_matris(k_son[0], k_son[1])
+        p_kom = matris_hda(M_kom)
+        q_kom = matris_qollar(M_kom)
+        h1_kom = matris_hda(poisson_matris(k_1h[0], k_1h[1])) if k_1h else None
+
+    if emsal_var and komanda_ok:
+        p_yekun = qarisdir(p_emsal, p_kom, W_EMSAL)
+        M_yekun = W_EMSAL * matris_normal(M_emsal) + (1 - W_EMSAL) * matris_normal(M_kom)
+        q_yekun = qarisdir(q_emsal, q_kom, 0.5)
+        h1_yekun = qarisdir(h1_emsal, h1_kom, W_EMSAL) if (h1_emsal and h1_kom) else (h1_emsal or h1_kom)
+        menbe = "əmsallar (80%) + komandalar (20%)"
+    elif emsal_var:
+        p_yekun, M_yekun, q_yekun, h1_yekun = p_emsal, M_emsal, dict(q_emsal), h1_emsal
+        menbe = f"əmsalları oxşar olan {len(oxsar)} keçmiş oyun"
+    else:
+        p_yekun, M_yekun, q_yekun, h1_yekun = p_kom, M_kom, dict(q_kom), h1_kom
+        menbe = f"komandaların son {il} ildəki oyunları (Poisson)"
+
+    # Bukmekerin qol əmsalları yazılıbsa, onlar daha dəqiqdir (testdə ən yaxşı nəticə)
+    qol_menbe = []
+    if btts_y and btts_n:
+        q_yekun["btts"] = (1 / btts_y) / (1 / btts_y + 1 / btts_n)
+        qol_menbe.append("BTTS əmsalı")
+    if ust25 and alt25:
+        q_yekun["o25"] = (1 / ust25) / (1 / ust25 + 1 / alt25)
+        qol_menbe.append("2.5 əmsalı")
+
+    netice = max(p_yekun, key=p_yekun.get)
+    btts_beli = bool(q_yekun["btts"] >= 0.5)
+    ust = bool(q_yekun["o25"] >= 0.5)
+    # Hesab hər üç proqnoza uyğun seçilir: nəticə + hər iki komanda vurur + 2.5 üst/alt
+    hesablar_top = netice_daxilinde_hesablar(M_yekun, netice, 3, btts=btts_beli, ust=ust,
+                                             p_btts=q_yekun["btts"], p_ust=q_yekun["o25"])
+    # Hesab hansı proqnozla uyğun gəlmir? (şərtlər birlikdə mümkün olmayanda)
+    _e, _q = map(int, hesablar_top[0][0].split("-"))
+    uygun_deyil = []
+    if ((_e > 0) and (_q > 0)) != btts_beli:
+        uygun_deyil.append("hər iki komanda vurur")
+    if ((_e + _q) > 2.5) != ust:
+        uygun_deyil.append("2.5 qol")
+
+    with st.container(border=True):
+        st.subheader("📌 Yekun proqnoz")
+        y1, y2, y3, y4, y5 = st.columns(5)
+        y1.metric("🏁 Nəticə", NETICE_ADI[netice].split(" (")[0], f"{p_yekun[netice]:.0%} · {etibar(p_yekun[netice])}",
+                  delta_color="off")
+        y2.metric("🎯 Gözlənilən hesab", hesablar_top[0][0], f"{hesablar_top[0][1]:.0%} ehtimal", delta_color="off")
+        # Hesabla ziddiyyət təşkil edən zəif proqnoz "Qeyri-müəyyən" kimi göstərilir
+        p_b = q_yekun["btts"] if btts_beli else 1 - q_yekun["btts"]
+        if "hər iki komanda vurur" in uygun_deyil:
+            y3.metric("⚽ Hər iki komanda vurur?", "⚖️ Qeyri-müəyyən",
+                      f"Bəli {q_yekun['btts']:.0%} / Xeyr {1 - q_yekun['btts']:.0%}", delta_color="off")
+        else:
+            y3.metric("⚽ Hər iki komanda vurur?", "Bəli" if btts_beli else "Xeyr", f"{p_b:.0%} · {etibar(p_b)}",
+                      delta_color="off")
+        p_u = q_yekun["o25"] if ust else 1 - q_yekun["o25"]
+        if "2.5 qol" in uygun_deyil:
+            y4.metric("📈 2.5 qol", "⚖️ Qeyri-müəyyən",
+                      f"Üst {q_yekun['o25']:.0%} / Alt {1 - q_yekun['o25']:.0%}", delta_color="off")
+        else:
+            y4.metric("📈 2.5 qol", "Üst" if ust else "Alt", f"{p_u:.0%} · {etibar(p_u)}", delta_color="off")
+        if h1_yekun:
+            n1 = max(h1_yekun, key=h1_yekun.get)
+            y5.metric("⏱️ 1-ci hissə", NETICE_ADI[n1].split(" – ")[0] + " – " +
+                      {"H": "Ev", "D": "Heç-heçə", "A": "Qonaq"}[n1],
+                      f"{h1_yekun[n1]:.0%} · {etibar(h1_yekun[n1])}", delta_color="off")
+        else:
+            y5.metric("⏱️ 1-ci hissə", "—", "məlumat yoxdur", delta_color="off")
+
+        st.markdown(
+            f"**{NETICE_ADI[netice]}**: {p_yekun[netice]:.1%} · "
+            f"Digərləri: " + ", ".join(f"{NETICE_ADI[k].split(' – ')[0]} {p_yekun[k]:.1%}" for k in "HDA" if k != netice))
+        st.markdown("**Proqnozlara uyğun ən ehtimal olunan hesablar:** " +
+                    " · ".join(f"**{h}** ({p:.1%})" for h, p in hesablar_top))
+        tek = netice_daxilinde_hesablar(M_yekun, netice, 1)[0]
+        if tek[0] != hesablar_top[0][0]:
+            st.caption(f"ℹ️ Tək hesab kimi ən ehtimallısı **{tek[0]}** ({tek[1]:.1%}) olardı, amma o, "
+                       f"digər proqnozlarla (hər iki komanda vurur: {'Bəli' if btts_beli else 'Xeyr'}, "
+                       f"2.5 {'Üst' if ust else 'Alt'}) uyğun gəlmir.")
+        if uygun_deyil:
+            st.caption(f"⚖️ '{uygun_deyil[0].capitalize()}' proqnozu təxminən 50/50-dir və digər proqnozlarla "
+                       f"birlikdə mümkün deyil, ona görə 'qeyri-müəyyən' göstərilir. Hesab daha etibarlı "
+                       f"proqnozlara görə seçilib.")
+        st.caption(f"Mənbə: {menbe}" + (f" · qol proqnozu: {', '.join(qol_menbe)}" if qol_menbe else "") +
+                   " · Testdə: nəticə ~50%, hər iki komanda vurur ~55%, 2.5 qol ~57%, dəqiq hesab ~12% düz çıxır "
+                   "(ətraflı: 📏 Dəqiqlik tabı).")
 
 tab_adlari = ["🎯 Proqnoz", "⏱️ Hissələr", "📊 Favorit statistikası", "📋 Oxşar oyunlar", "📏 Dəqiqlik"]
 tab1, tab2, tab3, tab4, tab5 = st.tabs(tab_adlari)
@@ -432,56 +600,105 @@ def deqiqlik_hesabla(df, il):
     # Bukmeker
     bukm = test[["pH", "pD", "pA"]].values
 
+    hesab_real = test["hesab"].values
+    btts_real = ((test["FTHG"] > 0) & (test["FTAG"] > 0)).values
+    o25_real = ((test["FTHG"] + test["FTAG"]) > 2.5).values
+
     # Model 1: əmsala görə (cədvəl YALNIZ train datasından)
-    m1 = []
+    m1, m1_btts, m1_o25, m1_hesab = [], [], [], []
     for h, d, a, ph, pd_, pa in zip(test["H"], test["D"], test["A"], test["pH"], test["pD"], test["pA"]):
         ox, _ = oxsar_tap(train, h, d, a, 0.04, 40)
-        if len(ox):
-            r = ox["FTR"].value_counts(normalize=True)
-            m1.append([r.get("H", 0), r.get("D", 0), r.get("A", 0)])
-        else:
-            m1.append([ph, pd_, pa])
+        r = ox["FTR"].value_counts(normalize=True)
+        p = [r.get("H", 0), r.get("D", 0), r.get("A", 0)]
+        m1.append(p)
+        m1_btts.append(((ox["FTHG"] > 0) & (ox["FTAG"] > 0)).mean())
+        m1_o25.append(((ox["FTHG"] + ox["FTAG"]) > 2.5).mean())
+        M = poisson_matris(ox["FTHG"].mean(), ox["FTAG"].mean())
+        m1_hesab.append(netice_daxilinde_hesablar(M, "HDA"[int(np.argmax(p))], 1)[0][0])
     m1 = np.clip(np.array(m1), 0.01, 1)
     m1 = m1 / m1.sum(axis=1, keepdims=True)
+    m1_btts, m1_o25, m1_hesab = np.array(m1_btts), np.array(m1_o25), np.array(m1_hesab)
 
     # Model 2: komandalara görə (hər oyun üçün yalnız ONDAN ƏVVƏLKİ oyunlar)
-    m2, idx = [], []
+    m2, m2_btts, m2_o25, m2_hesab, idx = [], [], [], [], []
     for n, (ev, q, t) in enumerate(zip(test["homeTeam"], test["awayTeam"], test["tarix"])):
         k = komanda_lambda(df, ev, q, t, il, "FTHG", "FTAG")
         if k:
-            p = matris_hda(poisson_matris(k[0], k[1]))
+            M = poisson_matris(k[0], k[1])
+            p = matris_hda(M)
+            qq = matris_qollar(M)
             m2.append([p["H"], p["D"], p["A"]])
+            m2_btts.append(qq["btts"])
+            m2_o25.append(qq["o25"])
+            m2_hesab.append(netice_daxilinde_hesablar(M, max(p, key=p.get), 1)[0][0])
             idx.append(n)
-    m2 = np.array(m2)
+    m2, m2_btts, m2_o25, m2_hesab = np.array(m2), np.array(m2_btts), np.array(m2_o25), np.array(m2_hesab)
+    qar = W_EMSAL * m1[idx] + (1 - W_EMSAL) * m2
 
     def olc(ad, p, y):
         return {"Model": ad, "Oyun": len(y), "Accuracy %": accuracy_score(y, p.argmax(1)) * 100,
                 "Log loss": log_loss(y, p, labels=[0, 1, 2])}
 
     y2 = y_hamisi[idx]
-    cedvel = pd.DataFrame([
+    netice_cedvel = pd.DataFrame([
         olc("Həmişə ev sahibi", np.tile([1, 0, 0], (len(test), 1)) * 0.98 + 0.01, y_hamisi),
         olc("Bukmeker", bukm, y_hamisi),
         olc("💰 Əmsala görə", m1, y_hamisi),
         olc("Bukmeker (komanda modelinin oyunları)", bukm[idx], y2),
         olc("👥 Komandalara görə", m2, y2),
-    ])
-    return cedvel.round(3), len(train), len(test)
+        olc("📌 Qarışıq: 80% əmsal + 20% komanda", qar, y2),
+    ]).round(3)
+
+    # Qol proqnozları: Bəli/Xeyr və Üst/Alt neçə faiz düz çıxdı
+    def duz(p, real):
+        return round(((np.asarray(p) >= 0.5) == real).mean() * 100, 1)
+
+    b_btts = (1 / test["BTTSY"]) / (1 / test["BTTSY"] + 1 / test["BTTSN"])
+    b_o25 = (1 / test["O25"]) / (1 / test["O25"] + 1 / test["U25"])
+    ok_b, ok_o = b_btts.notna().values, b_o25.notna().values
+    qol_cedvel = pd.DataFrame({
+        "Model": ["Həmişə 'Bəli' / 'Üst'", "Bukmekerin qol əmsalları", "💰 Əmsala görə", "👥 Komandalara görə"],
+        "Hər iki komanda vurur, düz %": [round(btts_real.mean() * 100, 1), duz(b_btts[ok_b], btts_real[ok_b]),
+                                          duz(m1_btts, btts_real), duz(m2_btts, btts_real[idx])],
+        "2.5 Üst/Alt, düz %": [round(o25_real.mean() * 100, 1), duz(b_o25[ok_o], o25_real[ok_o]),
+                               duz(m1_o25, o25_real), duz(m2_o25, o25_real[idx])],
+    })
+
+    en_cox = pd.Series(hesab_real).value_counts()
+    hesab_cedvel = pd.DataFrame({
+        "Model": [f"Həmişə '{en_cox.index[0]}' (ən çox gələn hesab)", "💰 Əmsala görə", "👥 Komandalara görə"],
+        "Dəqiq hesab, düz %": [round(en_cox.iloc[0] / len(hesab_real) * 100, 1),
+                               round((m1_hesab == hesab_real).mean() * 100, 1),
+                               round((m2_hesab == hesab_real[idx]).mean() * 100, 1)],
+    })
+    return netice_cedvel, qol_cedvel, hesab_cedvel, len(train), len(test)
 
 
 with tab5:
     st.subheader("📏 Modellər nə qədər dəqiqdir?")
     st.markdown("Modellər **2025-ci ilin iyulundan əvvəlki** oyunlarla qurulur və **sonrakı** oyunlarda yoxlanılır. "
                 "Yəni model yoxlanılan oyunların nəticəsini **görmür**, eynən real həyatda olduğu kimi.")
-    if st.button("▶️ Hesabla (təxminən 30 saniyə çəkir)"):
+    if st.button("▶️ Hesabla (1-2 dəqiqə çəkə bilər)"):
         with st.spinner("Hər test oyunu üçün proqnoz hesablanır..."):
-            cedvel, n_tr, n_te = deqiqlik_hesabla(df, il)
+            netice_cedvel, qol_cedvel, hesab_cedvel, n_tr, n_te = deqiqlik_hesabla(df, il)
         st.caption(f"Train: {n_tr:,} oyun · Test: {n_te:,} oyun")
-        st.dataframe(cedvel, hide_index=True, width="stretch")
-        st.bar_chart(cedvel.set_index("Model")["Accuracy %"], y_label="Accuracy %")
+
+        st.markdown("#### 🏁 Nəticə (1 / X / 2)")
+        st.dataframe(netice_cedvel, hide_index=True, width="stretch")
+        st.bar_chart(netice_cedvel.set_index("Model")["Accuracy %"], y_label="Accuracy %")
+
+        st.markdown("#### ⚽ Hər iki komanda vurur? · 📈 2.5 Üst/Alt")
+        st.dataframe(qol_cedvel, hide_index=True, width="stretch")
+
+        st.markdown("#### 🎯 Dəqiq hesab")
+        st.dataframe(hesab_cedvel, hide_index=True, width="stretch")
+
         st.markdown(
             "- **Accuracy:** ən yüksək ehtimallı nəticə neçə faiz oyunda düz çıxdı.\n"
             "- **Log loss:** verilən ehtimallar nə qədər dəqiqdir. **Kiçik olması yaxşıdır.**\n"
             "- Komanda modeli yalnız hər iki komandanın kifayət qədər oyunu olan matçlarda işləyir. "
             "Ona görə bukmekerlə müqayisə də **həmin oyunlarda** aparılır.\n"
-            "- ⚠️ 3 nəticəli futbol oyununda **50% accuracy** artıq yaxşı nəticədir: bukmeker də bu səviyyədədir.")
+            "- ⚠️ 3 nəticəli futbol oyununda **50% accuracy** artıq yaxşı nəticədir: bukmeker də bu səviyyədədir.\n"
+            "- ⚠️ 'Hər iki komanda vurur' və '2.5 qol' kimi iki variantlı suallarda təsadüfi təxmin **50%** verir. "
+            "Ona görə 55-57% kiçik, amma real üstünlükdür.\n"
+            "- ⚠️ Dəqiq hesab çox çətindir: ən yaxşı model belə təxminən **8 oyundan 1-ində** düz tapır.")
